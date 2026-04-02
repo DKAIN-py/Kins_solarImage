@@ -11,3 +11,6 @@ wheels/
 
 *.png
 *.jpg
+
+best_int8_openvino_model/
+model_export.py

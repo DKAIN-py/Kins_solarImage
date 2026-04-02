@@ -3,8 +3,8 @@ import torch
 from ultralytics import YOLO
 
 # ── Config ──────────────────────────────────────────────────────────────────
-_MODEL_PATH = './best.pt'  # Path to your YOLOv8 weights
-_DEVICE     = 'cuda'
+_MODEL_PATH = 'best.onnx'  # Path to your YOLOv8 weights
+_DEVICE     = 'cpu'
 
 # ── Private model state ─────────────────────────────────────────────────────
 _model = None
@@ -18,7 +18,7 @@ def load():
     
     # Load the model
     _model = YOLO(_MODEL_PATH, task="detect")
-    _model.to(_DEVICE)
+    # _model.to(_DEVICE)
     
     _ready = True
     print(f"[ModelLoader] Ready ✓")
@@ -53,3 +53,4 @@ def infer(image) -> list[tuple]:
             parsed_results.append((label, coords))
             
     return parsed_results
+
