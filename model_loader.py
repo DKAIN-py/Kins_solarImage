@@ -1,5 +1,4 @@
 # model_loader.py
-import torch
 from ultralytics import YOLO
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -39,7 +38,7 @@ def infer(image) -> list[tuple]:
     # Run inference
     # imgsz=640 should match your training size
     results = _model.predict(image, conf=0.25, device=_DEVICE, verbose=False)
-    
+    print(f"Raw infernce results: {results}")
     parsed_results = []
     if len(results) > 0:
         result = results[0]
@@ -51,6 +50,6 @@ def infer(image) -> list[tuple]:
             # Get class name
             label = result.names[int(box.cls[0])]
             parsed_results.append((label, coords))
-            
+    print(f"Parsed inference results: {parsed_results}")
     return parsed_results
 

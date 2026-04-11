@@ -13,8 +13,10 @@ dependencies = [
     "torch==2.5.1+cu124",
     "torchvision==0.20.1+cu124",
     "opencv-python==4.10.0.84",
-    "realesrgan==0.3.0",
     "basicsr==1.4.2",
+    "dotenv>=0.9.9",
+    "onnxruntime>=1.24.4",
+    "onnx>=1.21.0",
 ]
 
 [[tool.uv.index]]

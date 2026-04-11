@@ -1,31 +1,29 @@
 from shapely.geometry import box, Point, MultiPolygon
 from shapely.ops import unary_union
-# Assuming WIDTH/HEIGHT are imported or defined
-from config import HEIGHT, WIDTH 
+# Ensure these are defined in your config.py
 
-GSD            = 100 / 8192   
-BUFFER_M       = 0.5          
-MIN_AREA_M2    = 0.2          
-OVERLAP_THRESH = 0.5          
+HEIGHT, WIDTH = 1240, 1240  # Default fallback
+
+# Constants for Kins Engine
+GSD            = 0.0251   # Meters per pixel
+BUFFER_M       = 0.5          # Safety buffer in meters
+MIN_AREA_M2    = 0.2          # Minimum size for an obstacle to be considered
+OVERLAP_THRESH = 0.5          # 50% threshold for clipping logic
 
 def _px_to_m(px):
+    """Converts pixel value to meters rounded to 2 decimal places."""
     return round(px * GSD, 2)
 
-# REPLACED: No longer need 0-999 normalization parsing
-def _loc_to_pixel(coords):
-    """YOLOv8 already provides [x1, y1, x2, y2] in pixels."""
-    x1, y1, x2, y2 = coords
-    return int(x1), int(y1), int(x2), int(y2)
-
-def _format_polygon(geom) -> list[dict]:
-    """Handles both single Polygons and MultiPolygons safely."""
+def _format_polygon(geom, offset_x=0, offset_y=0) -> list[dict]:
+    """
+    Converts a shapely geometry into a list of {x, z} dictionaries.
+    Applies normalization offsets so the main roof starts at 0,0.
+    """
     if geom is None or geom.is_empty:
         return []
     
-    # If it's a MultiPolygon, we'll take the largest one or handle the first
-    # For Kins, we usually want the largest 'chunk' of free space
+    # Handle MultiPolygons by taking the largest part (common in free space)
     if geom.geom_type == 'MultiPolygon':
-        # Option A: Take the largest polygon in the collection
         main_part = max(geom.geoms, key=lambda a: a.area)
         coords = list(main_part.exterior.coords)[:-1]
     elif geom.geom_type == 'Polygon':
@@ -33,71 +31,86 @@ def _format_polygon(geom) -> list[dict]:
     else:
         return []
 
-    return [{'x': _px_to_m(p[0]), 'z': _px_to_m(p[1])} for p in coords]
+    # Map x to x, and y to z for your frontend format
+    return [{'x': _px_to_m(p[0] - offset_x), 'z': _px_to_m(p[1] - offset_y)} for p in coords]
 
 def loc_to_json(detections: list[tuple]) -> list[dict]:
-    """Input: [('rooftop', [x1, y1, x2, y2]), ...]"""
+    """
+    Converts raw model output [('label', [x1, y1, x2, y2])] to processed dicts.
+    """
     result = []
     for label, coords in detections:
-        x1, y1, x2, y2 = _loc_to_pixel(coords)
+        x1, y1, x2, y2 = coords
         
-        # Clamp coordinates to image boundaries
+        # Clamp to image boundaries
         x1, x2 = max(0, min(x1, WIDTH)), max(0, min(x2, WIDTH))
         y1, y2 = max(0, min(y1, HEIGHT)), max(0, min(y2, HEIGHT))
 
         result.append({
             'label': label,
-            'bbox': {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2},
-            'bbox_normalized': {
-                'x1': x1 / WIDTH,  'y1': y1 / HEIGHT,
-                'x2': x2 / WIDTH,  'y2': y2 / HEIGHT,
-            },
+            'bbox': {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
         })
     return result
 
+def get_parent_roof(object_list, payload):
+    coords   = payload.get('coordinates', {})
+    target_x = coords.get('x', 0)
+    target_y = coords.get('y', 0)
+    target   = Point(target_x, target_y)
 
-def get_parent_roof(object_list: list[dict], payload: dict):
-    """
-    Find the rooftop bbox that contains the user's clicked coordinates.
-    Returns largest containing rooftop as shapely box, or None if not found.
-    """
-    coords  = payload.get('coordinates', {})
-    target  = Point(coords.get('x', 0), coords.get('y', 0))
+    rooftops = [
+        (obj, box(obj['bbox']['x1'], obj['bbox']['y1'],
+                  obj['bbox']['x2'], obj['bbox']['y2']))
+        for obj in object_list if obj['label'] == 'rooftop'
+    ]
 
-    candidates = []
-    for obj in object_list:
-        if obj['label'] != 'rooftop':
-            continue
-        b = obj['bbox']
-        rect = box(b['x1'], b['y1'], b['x2'], b['y2'])
-        if rect.contains(target) or rect.intersects(target):
-            candidates.append(rect)
-
-    if not candidates:
+    if not rooftops:
         return None
 
-    # Return largest candidate (most likely the main roof)
-    return max(candidates, key=lambda r: r.area)
+    # First try exact containment
+    candidates = [rect for _, rect in rooftops if rect.contains(target) or rect.intersects(target)]
+    if candidates:
+        return max(candidates, key=lambda r: r.area)
 
+    # Fall back to nearest rooftop within 100px tolerance
+    closest      = None
+    closest_dist = float('inf')
+
+    for _, rect in rooftops:
+        dist = rect.exterior.distance(target)
+        if dist < closest_dist:
+            closest_dist = dist
+            closest      = rect
+
+    # Only accept if within 100 pixels
+    if closest_dist <= 100:
+        print(f"[DEBUG] Using nearest rooftop at distance {closest_dist:.1f}px")
+        return closest
+
+    print(f"[DEBUG] Nearest rooftop is {closest_dist:.1f}px away — too far")
+    return None
 
 def process_kins_site(object_list: list[dict], payload: dict) -> dict | None:
     """
-    Main geometry pipeline.
-    Returns site plan dict or None if no parent roof found.
+    Main Logic: Finds parent roof, clips obstacles, merges shapes, 
+    and normalizes coordinates to 0,0.
     """
     main_roof = get_parent_roof(object_list, payload)
     if main_roof is None:
         return None
 
-    buffer_px      = BUFFER_M / GSD
-    valid_obstacles = []
-    inner_roofs     = []
+    # Calculate Normalization Offsets (Top-Left of main roof)
+    min_x, min_y, _, _ = main_roof.bounds
+    buffer_px = BUFFER_M / GSD
+    
+    valid_obs_geoms = []
+    inner_roofs_data = []
+    inner_roofs_geoms = []
 
     for obj in object_list:
-        b        = obj['bbox']
+        b = obj['bbox']
         obj_geom = box(b['x1'], b['y1'], b['x2'], b['y2'])
 
-        # Skip the main roof itself
         if obj_geom.equals(main_roof):
             continue
 
@@ -105,51 +118,58 @@ def process_kins_site(object_list: list[dict], payload: dict) -> dict | None:
         if intersection.is_empty:
             continue
 
+        # 50% Overlap Threshold Logic
         overlap_ratio = intersection.area / obj_geom.area
         if overlap_ratio < OVERLAP_THRESH:
             continue
 
-        # Clip to roof boundary
         clipped = intersection
 
         if obj['label'] == 'rooftop':
-            inner_roofs.append(clipped)
+            # This is an Upper Roof (Room on the terrace)
+            inner_roofs_geoms.append(clipped)
+            
+            # Calculate free space on the upper room (inward buffer)
+            upper_free = clipped.buffer(-buffer_px)
+            
+            inner_roofs_data.append({
+                'footprint': _format_polygon(clipped, min_x, min_y),
+                'free_space': _format_polygon(upper_free, min_x, min_y),
+                'obstacles': [] # Placeholder for nested objects
+            })
         else:
-            # Skip tiny obstacles
+            # Standard Obstacles (Tanks, ACs, etc.)
             area_m2 = clipped.area * (GSD ** 2)
             if area_m2 < MIN_AREA_M2:
                 continue
-            # Apply safety buffer, clipped to roof boundary
+            
+            # Apply safety buffer for the main terrace calculation
             buffered = clipped.buffer(buffer_px).intersection(main_roof)
-            valid_obstacles.append(buffered)
+            valid_obs_geoms.append(buffered)
 
-    # Merge overlapping obstacles into single shapes
-    merged_obstacles = unary_union(valid_obstacles) if valid_obstacles else None
+    # Merge overlapping obstacles to simplify the final polygon
+    merged_obs_geom = unary_union(valid_obs_geoms) if valid_obs_geoms else None
 
-    # Subtract obstacles and inner roofs from main roof
-    to_subtract   = unary_union(
-        ([merged_obstacles] if merged_obstacles else []) + inner_roofs
+    # Calculate Free Space (Main Roof - Obstacles - Upper Rooms)
+    to_subtract = unary_union(
+        ([merged_obs_geom] if merged_obs_geom else []) + inner_roofs_geoms
     )
-    free_space    = main_roof.difference(to_subtract) if to_subtract else main_roof
+    free_space_geom = main_roof.difference(to_subtract) if to_subtract else main_roof
 
-    # Format obstacles for output
-    if merged_obstacles is None or merged_obstacles.is_empty:
-        obs_list = []
-    elif isinstance(merged_obstacles, MultiPolygon):
-        obs_list = [{'points': _format_polygon(g)} for g in merged_obstacles.geoms]
-    else:
-        obs_list = [{'points': _format_polygon(merged_obstacles)}]
+    # Build Final Obstacles List for Output
+    final_obstacles = []
+    if merged_obs_geom:
+        parts = merged_obs_geom.geoms if isinstance(merged_obs_geom, MultiPolygon) else [merged_obs_geom]
+        for p in parts:
+            final_obstacles.append({
+                "height": None, # Requested: null/none
+                "points": _format_polygon(p, min_x, min_y)
+            })
 
+    # Return structure matching your MOCK_SITE_DATA
     return {
-        'roof_polygon':      _format_polygon(main_roof),
-        'free_space_polygon': _format_polygon(free_space),
-        'obstacles':         obs_list,
-        'upper_roofs':       [{'footprint': _format_polygon(r)} for r in inner_roofs],
-        'stats': {
-            'roof_area_m2':       round(main_roof.area * GSD**2, 2),
-            'free_space_area_m2': round(free_space.area * GSD**2, 2)
-            if not free_space.is_empty else 0,
-            'obstacle_count':     len(obs_list),
-            'inner_roof_count':   len(inner_roofs),
-        }
+        'roof_polygon':       _format_polygon(main_roof, min_x, min_y),
+        'free_space_polygon': _format_polygon(free_space_geom, min_x, min_y),
+        'obstacles':          final_obstacles,
+        'upper_roofs':        inner_roofs_data
     }
